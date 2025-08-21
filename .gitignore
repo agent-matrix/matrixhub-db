@@ -7,3 +7,4 @@ backups/
 # Editor/OS clutter
 .DS_Store
 *.swp
+scripts/install_docker_ol9 copy.sh

@@ -1,26 +1,38 @@
 #!/usr/bin/env bash
+#
+# Installs Docker CE on Oracle Linux 9.
+# This script is designed to be idempotent (it can be run multiple times safely).
+
+# Exit immediately if a command exits with a non-zero status.
+# Treat unset variables as an error.
 set -Eeuo pipefail
-# Install Docker CE on Oracle Linux 9
 
-if ! command -v sudo >/dev/null 2>&1; then
-  echo "✖ sudo is required"; exit 1
-fi
+echo "▶ Step 1/6: Install Docker"
 
-echo "▶ Installing Docker CE repo (Oracle Linux 9)"
+# --- Install prerequisites ---
+echo "▶ Ensuring dnf-plugins-core is installed..."
 sudo dnf -y install dnf-plugins-core
-sudo dnf config-manager --add-repo https://download.docker.com/linux/oracle/docker-ce.repo
 
-echo "▶ Installing Docker"
-sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+# --- Add Docker CE official repository ---
+# This is the corrected line. Docker uses the CentOS repo for Oracle Linux.
+echo "▶ Installing Docker CE repo (Oracle Linux 9 using CentOS repo)..."
+sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
 
-echo "▶ Enabling and starting docker"
-sudo systemctl enable --now docker
+# --- Install Docker Engine ---
+echo "▶ Installing Docker packages..."
+# The --nobest option is a safeguard against potential dependency issues on OL9.
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin --nobest
 
-# Add current user to docker group (requires re-login)
-if ! id -nG "$USER" | grep -qw docker; then
-  echo "▶ Adding $USER to docker group"
-  sudo usermod -aG docker "$USER"
-  echo "ℹ You may need to log out/in (or run 'newgrp docker') to use docker without sudo."
-fi
+# --- Start and enable Docker service ---
+echo "▶ Starting and enabling the Docker service..."
+sudo systemctl start docker
+sudo systemctl enable docker
 
-echo "✅ Docker installed"
+# --- Add current user to the 'docker' group ---
+# This allows running Docker commands without sudo.
+# Note: You will need to log out and log back in for this change to take effect.
+echo "▶ Adding current user '$USER' to the 'docker' group..."
+sudo usermod -aG docker $USER
+
+echo "✅ Docker installed successfully."
+echo "❗ IMPORTANT: You must log out and log back in for group changes to apply."
