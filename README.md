@@ -21,7 +21,7 @@ ssh -i /path/to/your_key opc@<public-ip>
 
 # 2) Install git & make and clone the repo
 sudo dnf -y install git make
-git clone <your-repo-url> matrixhub-db
+git clone https://github.com/agent-matrix/matrixhub-db.git
 cd matrixhub-db
 
 # 3) Configure secrets
