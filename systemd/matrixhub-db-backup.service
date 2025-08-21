@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly backup of MatrixHub DB (docker exec pg_dump)
+
+[Service]
+Type=oneshot
+# IMPORTANT: Adjust WorkingDirectory to the absolute path of your repo location
+WorkingDirectory=/home/opc/matrixhub-db
+ExecStart=/usr/bin/make backup-now
+
+[Install]
+WantedBy=multi-user.target

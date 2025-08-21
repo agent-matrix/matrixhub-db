@@ -1,0 +1,16 @@
+# keep the db build context small and clean
+**/.DS_Store
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache
+**/.venv
+backups/
+.env*
+.git
+.gitignore
+README.md
+Makefile
+scripts/
+systemd/
+pgbouncer/
+monitoring/

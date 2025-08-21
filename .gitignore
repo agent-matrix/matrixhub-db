@@ -1,0 +1,9 @@
+# Local environment files (never commit secrets)
+.env.db
+
+# Backups
+backups/
+
+# Editor/OS clutter
+.DS_Store
+*.swp
