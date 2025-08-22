@@ -45,5 +45,3 @@ Gunicorn starts on `:443` with:
 * SSL/TLS → **Full (strict)**
 * Edge Certificates → (optional) “Always Use HTTPS”: **On**
 * Network → HTTP/2 + HTTP/3: **On**
-
-```
