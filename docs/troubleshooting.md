@@ -1,12 +1,9 @@
-
 # Troubleshooting
 
 ## Hub worker exits with code 52
 If Hub logs show:
 ```
-
 \[ERROR] Worker (pid\:XX) exited with code 52
-
 ```
 Check your environment files are present and valid:
 - Hub: `.env` (or `.env.example`)
@@ -27,7 +24,7 @@ Ports <1024 may require extra capability. The run script configures the containe
 - Ensure both DB and pgAdmin containers are on `matrixhub-net`.
 - Use host `matrixhub-db` (or `db`), port `5432`.
 - Verify DB is healthy:
-  ```bash
+```bash
   docker inspect -f '{{.State.Health.Status}}' matrixhub-db
 ```
 
@@ -37,9 +34,9 @@ Ports <1024 may require extra capability. The run script configures the containe
 
 * Check container logs:
 
-  ```bash
-  docker logs -f matrixhub-db
-  ```
+```bash
+docker logs -f matrixhub-db
+```
 * Ensure `.env.db` exists (or the `.env.db.template` symlink fallback).
 * If you changed tuning params (e.g., `shared_buffers`), roll them back and retry.
 
