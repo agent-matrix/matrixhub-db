@@ -259,3 +259,36 @@ _ensure-env: ## Internal: Create .env.db from template if it's missing.
 
 _ensure-scripts-executable: ## Internal: Make sure all helper scripts are executable.
 	@chmod +x ./scripts/*.sh ./systemd/*.sh 2>/dev/null || true
+
+
+# ==============================================================================
+# 🚀 Appended: pgAdmin integration (non-destructive)
+# ==============================================================================
+
+# Additional configuration for pgAdmin (safe defaults; override as needed)
+PGADMIN_CONTAINER_NAME ?= pgadmin
+PGADMIN_PORT ?= 5050
+
+.PHONY: pgadmin-up health-pgadmin health-all init-all
+
+pgadmin-up: _ensure-scripts-executable _ensure-env ## Start pgAdmin (uses POSTGRES_PASSWORD for login)
+	@echo "--> Starting pgAdmin on $(PGADMIN_PORT)..."
+	@./scripts/start_pgadmin.sh
+
+health-pgadmin: ## Wait until pgAdmin responds on http://127.0.0.1:$(PGADMIN_PORT)
+	@echo "--> Checking pgAdmin health on port $(PGADMIN_PORT)..."
+	@if [ -z "$$($(SUDO) docker ps -q -f name=^$(PGADMIN_CONTAINER_NAME)$$)" ]; then \
+		echo "$(YELLOW)⚠ pgAdmin container '$(PGADMIN_CONTAINER_NAME)' not running.$(NC)"; exit 1; \
+	fi
+	@bash -c 'for i in {1..60}; do \
+		code=$$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$(PGADMIN_PORT)/ || true); \
+		if [ "$$code" = "200" ] || [ "$$code" = "302" ]; then \
+			echo "$(GREEN)✓ pgAdmin healthy (HTTP $$code).$(NC)"; exit 0; \
+		fi; \
+		sleep 2; \
+	done; echo "$(RED)✖ pgAdmin did not become ready on port $(PGADMIN_PORT).$(NC)"; exit 1'
+
+health-all: health health-pgadmin ## Check health of both DB and pgAdmin
+
+init-all: init pgadmin-up health-all ## Run init, then start pgAdmin, then check both services
+	@true

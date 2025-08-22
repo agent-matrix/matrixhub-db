@@ -8,3 +8,5 @@ backups/
 .DS_Store
 *.swp
 scripts/install_docker_ol9 copy.sh
+* copy.*
+* copy *

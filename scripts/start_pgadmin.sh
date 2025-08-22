@@ -65,9 +65,15 @@ PGADMIN_IMAGE="${PGADMIN_IMAGE:-dpage/pgadmin4}"
 PGADMIN_TAG="${PGADMIN_TAG:-latest}"
 PGADMIN_FULL_IMAGE="${PGADMIN_IMAGE}:${PGADMIN_TAG}"
 PGADMIN_PORT="${PGADMIN_PORT:-5050}"
-PGADMIN_EMAIL="${PGADMIN_EMAIL:-admin@local}"
+PGADMIN_EMAIL="${PGADMIN_EMAIL:-admin@matrixhub.io}"   # ✅ valid default email
 PGADMIN_VOLUME_NAME="${PGADMIN_VOLUME_NAME:-matrixhub-pgadmin}"
 NETWORK_NAME="${NETWORK_NAME:-matrixhub-net}"
+
+# Basic email sanity check to avoid restart loop
+if ! [[ "${PGADMIN_EMAIL}" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then
+  warn "PGADMIN_EMAIL='${PGADMIN_EMAIL}' looks invalid; falling back to admin@matrixhub.io"
+  PGADMIN_EMAIL="admin@matrixhub.io"
+fi
 
 # ---------------------------
 # Ensure network & volume
