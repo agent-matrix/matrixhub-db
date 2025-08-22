@@ -1,0 +1,16 @@
+site_name: MatrixHub
+site_description: Lightweight docs for developing and running MatrixHub
+theme:
+  name: readthedocs
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Database: database.md
+  - Run the Hub (TLS): hub.md
+  - pgAdmin UI: pgadmin.md
+  - Troubleshooting: troubleshooting.md
+markdown_extensions:
+  - admonition
+  - codehilite
+  - toc:
+      permalink: true
