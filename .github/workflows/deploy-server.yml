@@ -1,11 +1,10 @@
 name: Deploy DB host
 
 # Triggers a remote update on the OCI OL9 VM that runs the local
-# (fallback) Postgres container. Used while you keep the OL9 Postgres
-# alive as a hot backup alongside Aiven.
+# (fallback) Postgres container.
 #
-# Once you fully decommission OL9, set repo variable
-# DISABLE_DEPLOY=true and remove the secrets.
+# Required secrets:  DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY
+# Optional secret:   DEPLOY_KNOWN_HOSTS  (ssh-keyscan fallback if absent)
 
 on:
   release:
@@ -35,19 +34,20 @@ jobs:
       - name: Verify required secrets
         shell: bash
         env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST:    ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER:    ${{ secrets.DEPLOY_USER }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
           missing=()
-          [ -n "$DEPLOY_HOST"        ] || missing+=(DEPLOY_HOST)
-          [ -n "$DEPLOY_USER"        ] || missing+=(DEPLOY_USER)
-          [ -n "$DEPLOY_SSH_KEY"     ] || missing+=(DEPLOY_SSH_KEY)
-          [ -n "$DEPLOY_KNOWN_HOSTS" ] || missing+=(DEPLOY_KNOWN_HOSTS)
+          [ -n "$DEPLOY_HOST"    ] || missing+=(DEPLOY_HOST)
+          [ -n "$DEPLOY_USER"    ] || missing+=(DEPLOY_USER)
+          [ -n "$DEPLOY_SSH_KEY" ] || missing+=(DEPLOY_SSH_KEY)
           if [ "${#missing[@]}" -gt 0 ]; then
             echo "::error::Missing required secrets: ${missing[*]}"
             exit 1
+          fi
+          if [ -z "${{ secrets.DEPLOY_KNOWN_HOSTS }}" ]; then
+            echo "::notice::DEPLOY_KNOWN_HOSTS not set — will run ssh-keyscan on DEPLOY_HOST (TOFU)."
           fi
 
       - name: Determine target tag
@@ -66,12 +66,20 @@ jobs:
       - name: Configure SSH
         shell: bash
         env:
-          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          KNOWN:   ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          SSH_KEY:     ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN:       ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
-          printf '%s\n' "$KNOWN"  > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+          if [ -n "$KNOWN" ]; then
+            printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H -T 10 "$DEPLOY_HOST" > ~/.ssh/known_hosts 2>/dev/null || true
+            [ -s ~/.ssh/known_hosts ] || { echo "::error::ssh-keyscan failed for $DEPLOY_HOST"; exit 1; }
+          fi
+          chmod 644 ~/.ssh/known_hosts
 
       - name: Update on OL9
         shell: bash

@@ -2,19 +2,27 @@ name: Aiven verify
 
 # Quick health + schema check against the Aiven Postgres service.
 # Runs:
-#   - on every push to master (catches accidental schema drift),
-#   - on every PR (so reviewers see if the PR breaks DB invariants),
-#   - daily on schedule (catches Aiven outages),
-#   - on manual dispatch.
+#   - on every push to master       (catches accidental schema drift)
+#   - on every PR                   (so reviewers see if a PR breaks DB invariants)
+#   - daily on schedule             (catches Aiven outages)
+#   - on manual dispatch
 #
 # Required secret: AIVEN_DATABASE_URL
+#
+# State semantics (so this workflow doesn't spam red on a fresh DB):
+#   - DB unreachable               → ::error::      (real outage)
+#   - DB reachable, completely empty (no entity table at all)
+#                                  → ::warning:: + exit 0, points at "Aiven bootstrap"
+#   - DB reachable, some tables but the entity / remote / embedding_chunk
+#     are missing                  → ::error::      (real drift)
+#   - everything present           → success
 
 on:
   push:
     branches: [master, main]
   pull_request:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -56,12 +64,54 @@ jobs:
           sudo apt-get install -y --no-install-recommends postgresql-client-17
 
       - name: Connectivity + version
+        id: conn
         shell: bash
         env:
           U: ${{ secrets.AIVEN_DATABASE_URL }}
-        run: PGCONNECT_TIMEOUT=15 psql "$U" -c 'SELECT version(), current_database(), now();'
+        run: |
+          set -euo pipefail
+          PGCONNECT_TIMEOUT=15 psql "$U" -c 'SELECT version(), current_database(), now();'
+
+      - name: Detect bootstrap state
+        id: state
+        shell: bash
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          tables="$(PGCONNECT_TIMEOUT=15 psql "$U" -tAc \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';")"
+          tables="${tables:-0}"
+          echo "public_table_count=$tables" >> "$GITHUB_OUTPUT"
+          echo "Public tables in this DB: $tables"
+          if [ "$tables" -eq 0 ]; then
+            echo "state=fresh" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=initialised" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Friendly skip when DB is not bootstrapped yet
+        if: steps.state.outputs.state == 'fresh'
+        shell: bash
+        run: |
+          BOOT="${{ github.server_url }}/${{ github.repository }}/actions/workflows/aiven-bootstrap.yml"
+          echo "::warning::Aiven DB has no public tables — schema not bootstrapped yet."
+          {
+            echo "## :information_source: Aiven not bootstrapped"
+            echo
+            echo "The DB is reachable but contains no tables. This is the expected"
+            echo "state for a brand-new Aiven service before anyone runs the bootstrap."
+            echo
+            echo "**Action**: trigger [Aiven bootstrap]($BOOT) (one click)."
+            echo "It will run \`init_aiven.sh\` then \`populate_aiven_from_catalog.py\`,"
+            echo "after which this verify workflow will turn green automatically on its"
+            echo "next 30-min run."
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Soft-pass — don't spam red on every schedule.
+          exit 0
 
       - name: Schema check
+        if: steps.state.outputs.state == 'initialised'
         shell: bash
         env:
           U: ${{ secrets.AIVEN_DATABASE_URL }}
@@ -74,22 +124,30 @@ jobs:
           # Required tables for matrix-hub catalog
           for t in entity embedding_chunk remote; do
             psql "$U" -tAc "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='$t';" \
-              | grep -q '^1$' || { echo "::error::missing required table: $t"; exit 1; }
+              | grep -q '^1$' || { echo "::error::DB has tables but is missing required: $t"; exit 1; }
           done
           echo "All required tables present."
           # Required extensions
           for e in pg_trgm; do
             psql "$U" -tAc "SELECT 1 FROM pg_extension WHERE extname='$e';" \
-              | grep -q '^1$' || { echo "::warning::extension $e missing — search may be limited"; }
+              | grep -q '^1$' || echo "::warning::extension $e missing — search may be limited"
           done
 
       - name: Row counts
+        if: steps.state.outputs.state == 'initialised'
         shell: bash
         env:
           U: ${{ secrets.AIVEN_DATABASE_URL }}
         run: |
+          set -euo pipefail
           counts="$(psql "$U" -tAc \
             "SELECT 'entity='||(SELECT count(*) FROM entity)||', embedding_chunk='||(SELECT count(*) FROM embedding_chunk)||', remote='||(SELECT count(*) FROM remote);")"
           echo "$counts"
-          echo "## Aiven row counts" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`$counts\`" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Aiven row counts"
+            echo "\`$counts\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Heads-up if the catalog ingestion never ran
+          if psql "$U" -tAc "SELECT 1 FROM entity LIMIT 1;" | grep -qv '^1$'; then
+            echo "::warning::entity table is empty — run 'Populate Aiven from catalog' or 'Aiven bootstrap'."
+          fi
