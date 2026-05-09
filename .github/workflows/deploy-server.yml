@@ -1,0 +1,104 @@
+name: Deploy DB host
+
+# Triggers a remote update on the OCI OL9 VM that runs the local
+# (fallback) Postgres container. Used while you keep the OL9 Postgres
+# alive as a hot backup alongside Aiven.
+#
+# Once you fully decommission OL9, set repo variable
+# DISABLE_DEPLOY=true and remove the secrets.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to deploy (defaults to latest)."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-db-host
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: SSH update OL9
+    runs-on: ubuntu-latest
+    if: ${{ vars.DISABLE_DEPLOY != 'true' }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Verify required secrets
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          missing=()
+          [ -n "$DEPLOY_HOST"        ] || missing+=(DEPLOY_HOST)
+          [ -n "$DEPLOY_USER"        ] || missing+=(DEPLOY_USER)
+          [ -n "$DEPLOY_SSH_KEY"     ] || missing+=(DEPLOY_SSH_KEY)
+          [ -n "$DEPLOY_KNOWN_HOSTS" ] || missing+=(DEPLOY_KNOWN_HOSTS)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing required secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Determine target tag
+        id: target
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG=""
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN:   ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN"  > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+
+      - name: Update on OL9
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '~/matrixhub-db' }}
+          TARGET_TAG:  ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy \
+              -o StrictHostKeyChecking=yes \
+              -o IdentitiesOnly=yes \
+              -o ConnectTimeout=15 \
+              "${DEPLOY_USER}@${DEPLOY_HOST}" \
+              bash -lc "'cd ${DEPLOY_PATH} && \
+                        git fetch --tags --prune && \
+                        if [ -n \"${TARGET_TAG}\" ]; then git checkout tags/${TARGET_TAG}; else git checkout master && git pull --ff-only origin master; fi && \
+                        make build && make up && make health && make verify'"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## DB host deploy"
+            echo "- Trigger: \`${{ github.event_name }}\`"
+            echo "- Tag:     \`${{ steps.target.outputs.tag || '(latest master)' }}\`"
+            echo "- Host:    \`${{ secrets.DEPLOY_HOST }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
