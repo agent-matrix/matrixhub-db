@@ -1,0 +1,99 @@
+name: Populate Aiven from catalog
+
+# Click-to-run workflow that fills the Aiven `entity` table from
+# https://github.com/agent-matrix/catalog. Idempotent — safe to re-run.
+#
+# Required secret:
+#   AIVEN_DATABASE_URL = postgresql://avnadmin:<PW>@HOST:PORT/defaultdb?sslmode=require
+#
+# Optional inputs (workflow_dispatch):
+#   include_statuses  default "active"  (try "active,deprecated" for everything except disabled)
+#   limit             default 0         (0 = no cap; for testing set e.g. 50)
+#   workers           default 16        (parallel manifest fetches)
+#   dry_run           default false     (fetch + transform without writing)
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_statuses:
+        description: 'Statuses to include (comma list).'
+        required: false
+        default: 'active'
+      limit:
+        description: 'Max items to process (0 = no cap).'
+        required: false
+        default: '0'
+      workers:
+        description: 'Parallel manifest fetchers.'
+        required: false
+        default: '16'
+      dry_run:
+        description: 'DRY_RUN — fetch and transform without writing to Aiven.'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aiven-populate
+  cancel-in-progress: false
+
+jobs:
+  populate:
+    name: catalog → Aiven UPSERT
+    runs-on: ubuntu-latest
+    if: ${{ vars.DISABLE_AIVEN_POPULATE != 'true' }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Verify secret
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          if [ -z "$U" ]; then
+            echo "::error::AIVEN_DATABASE_URL secret is missing. Add it in Settings → Secrets → Actions."
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install psycopg
+        run: pip install --quiet 'psycopg[binary]'
+
+      - name: Fetch populate_aiven_from_catalog.py
+        run: |
+          set -euo pipefail
+          mkdir -p scripts
+          curl -fsSL \
+            "https://raw.githubusercontent.com/agent-matrix/matrix-hub/master/scripts/populate_aiven_from_catalog.py" \
+            -o scripts/populate_aiven_from_catalog.py
+          chmod +x scripts/populate_aiven_from_catalog.py
+          wc -l scripts/populate_aiven_from_catalog.py
+
+      - name: Run populator
+        env:
+          AIVEN_URL:        ${{ secrets.AIVEN_DATABASE_URL }}
+          INCLUDE_STATUSES: ${{ inputs.include_statuses }}
+          LIMIT:            ${{ inputs.limit }}
+          WORKERS:          ${{ inputs.workers }}
+          DRY_RUN:          ${{ inputs.dry_run == 'true' && '1' || '0' }}
+        run: python3 scripts/populate_aiven_from_catalog.py
+
+      - name: Summary
+        if: always()
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          {
+            echo "## Populate result"
+            echo "- include_statuses: \`${{ inputs.include_statuses }}\`"
+            echo "- limit:            \`${{ inputs.limit }}\`"
+            echo "- workers:          \`${{ inputs.workers }}\`"
+            echo "- dry_run:          \`${{ inputs.dry_run }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
