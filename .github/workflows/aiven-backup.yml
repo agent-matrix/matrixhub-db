@@ -1,0 +1,110 @@
+name: Aiven backup
+
+# Daily pg_dump of the Aiven Postgres service, uploaded as a GitHub
+# Actions artifact (free tier: 90-day retention max). Also runnable
+# on demand via workflow_dispatch.
+#
+# What this protects against:
+#   - accidental DROP / DELETE on Aiven (managed PiTR is paid-only),
+#   - Aiven service deletion / billing lapse,
+#   - regional incident.
+#
+# Required secret: AIVEN_DATABASE_URL
+#   postgresql://avnadmin:PASSWORD@pg-37455d5-matrixhub-db.c.aivencloud.com:24870/defaultdb?sslmode=require
+
+on:
+  schedule:
+    - cron: "17 3 * * *"     # 03:17 UTC every day
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: "Artifact retention in days (1–90)."
+        required: false
+        default: "30"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aiven-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    name: pg_dump → artifact
+    runs-on: ubuntu-latest
+    if: ${{ vars.DISABLE_AIVEN_BACKUP != 'true' }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Verify secret
+        shell: bash
+        env:
+          AIVEN_DATABASE_URL: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          if [ -z "$AIVEN_DATABASE_URL" ]; then
+            echo "::error::AIVEN_DATABASE_URL secret missing. Add it in Settings → Secrets → Actions."
+            exit 1
+          fi
+
+      - name: Install Postgres 17 client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          pg_dump --version
+
+      - name: Probe Aiven
+        shell: bash
+        env:
+          AIVEN_DATABASE_URL: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          PGCONNECT_TIMEOUT=15 psql "$AIVEN_DATABASE_URL" -c 'SELECT version(), now();'
+
+      - name: pg_dump
+        id: dump
+        shell: bash
+        env:
+          AIVEN_DATABASE_URL: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          ts="$(date -u +%Y%m%d_%H%M%SZ)"
+          file="aiven-matrixhub-${ts}.dump"
+          echo "Dumping to $file (custom format)…"
+          pg_dump "$AIVEN_DATABASE_URL" \
+            --format=custom --no-owner --no-privileges \
+            --file="$file"
+          ls -lh "$file"
+          # row-count snapshot for quick sanity in summary
+          counts="$(psql "$AIVEN_DATABASE_URL" -tAc \
+            "SELECT 'entity='||(SELECT count(*) FROM entity)||', embedding_chunk='||(SELECT count(*) FROM embedding_chunk)||', remote='||(SELECT count(*) FROM remote);")"
+          echo "file=$file"   >> "$GITHUB_OUTPUT"
+          echo "counts=$counts" >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -c%s "$file")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.dump.outputs.file }}
+          path: ${{ steps.dump.outputs.file }}
+          retention-days: ${{ inputs.retention_days || '30' }}
+          if-no-files-found: error
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Aiven backup"
+            echo "- File:   \`${{ steps.dump.outputs.file }}\`"
+            echo "- Size:   \`${{ steps.dump.outputs.size }} bytes\`"
+            echo "- Rows:   \`${{ steps.dump.outputs.counts }}\`"
+            echo "- Retain: ${{ inputs.retention_days || '30' }} day(s)"
+          } >> "$GITHUB_STEP_SUMMARY"

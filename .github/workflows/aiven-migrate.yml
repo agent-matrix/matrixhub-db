@@ -1,0 +1,130 @@
+name: Migrate OL9 → Aiven
+
+# Manually-triggered, one-shot migration of the legacy OL9 Postgres
+# container's data into the Aiven service. Wraps scripts/migrate_to_aiven.sh
+# by SSHing to the OL9 host and running it there (so pg_dump runs against
+# the live local container).
+#
+# Required secrets:
+#   DEPLOY_HOST          OL9 public IP (141.148.40.165)
+#   DEPLOY_USER          opc
+#   DEPLOY_SSH_KEY       deploy private key
+#   DEPLOY_KNOWN_HOSTS   ssh-keyscan output for DEPLOY_HOST
+#   AIVEN_PASSWORD       avnadmin password (URL-encoding handled by the script)
+#
+# Optional repository variables:
+#   AIVEN_HOST  (default: pg-37455d5-matrixhub-db.c.aivencloud.com)
+#   AIVEN_PORT  (default: 24870)
+#   AIVEN_USER  (default: avnadmin)
+#   AIVEN_DB    (default: defaultdb)
+#   ENABLE_VECTOR (set to '1' to also create the pgvector extension)
+#
+# This is workflow_dispatch-only on purpose — running it twice is
+# disruptive; you typically only do it once at cutover time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_vector:
+        description: "Also create the pgvector extension on Aiven? (1/0)"
+        required: false
+        default: "0"
+        type: choice
+        options: ["0", "1"]
+      keep_dump:
+        description: "Keep the local dump file on OL9 after success? (1/0)"
+        required: false
+        default: "1"
+        type: choice
+        options: ["1", "0"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aiven-migrate
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: SSH OL9 → migrate_to_aiven.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: aiven-migration   # require manual approval per repo settings
+
+    steps:
+      - name: Verify required secrets
+        shell: bash
+        env:
+          DEPLOY_HOST:        ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER:        ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY:     ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          AIVEN_PASSWORD:     ${{ secrets.AIVEN_PASSWORD }}
+        run: |
+          missing=()
+          [ -n "$DEPLOY_HOST"        ] || missing+=(DEPLOY_HOST)
+          [ -n "$DEPLOY_USER"        ] || missing+=(DEPLOY_USER)
+          [ -n "$DEPLOY_SSH_KEY"     ] || missing+=(DEPLOY_SSH_KEY)
+          [ -n "$DEPLOY_KNOWN_HOSTS" ] || missing+=(DEPLOY_KNOWN_HOSTS)
+          [ -n "$AIVEN_PASSWORD"     ] || missing+=(AIVEN_PASSWORD)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing required secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN:   ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN"  > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+
+      - name: Run migrate_to_aiven.sh on OL9
+        shell: bash
+        env:
+          DEPLOY_HOST:    ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER:    ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH:    ${{ vars.DEPLOY_PATH || '~/matrixhub-db' }}
+          AIVEN_HOST:     ${{ vars.AIVEN_HOST  || 'pg-37455d5-matrixhub-db.c.aivencloud.com' }}
+          AIVEN_PORT:     ${{ vars.AIVEN_PORT  || '24870' }}
+          AIVEN_USER:     ${{ vars.AIVEN_USER  || 'avnadmin' }}
+          AIVEN_DB:       ${{ vars.AIVEN_DB    || 'defaultdb' }}
+          AIVEN_PASSWORD: ${{ secrets.AIVEN_PASSWORD }}
+          ENABLE_VECTOR:  ${{ inputs.enable_vector }}
+          KEEP_DUMP:      ${{ inputs.keep_dump }}
+        run: |
+          set -euo pipefail
+          # Pass env through to the remote shell. AIVEN_PASSWORD travels in
+          # the SSH channel only and is masked in step logs.
+          ssh -i ~/.ssh/id_deploy \
+              -o StrictHostKeyChecking=yes \
+              -o IdentitiesOnly=yes \
+              -o ConnectTimeout=15 \
+              -o SendEnv=AIVEN_HOST,AIVEN_PORT,AIVEN_USER,AIVEN_DB,AIVEN_PASSWORD,ENABLE_VECTOR,KEEP_DUMP \
+              "${DEPLOY_USER}@${DEPLOY_HOST}" \
+              env AUTO=1 \
+                  AIVEN_HOST="$AIVEN_HOST" \
+                  AIVEN_PORT="$AIVEN_PORT" \
+                  AIVEN_USER="$AIVEN_USER" \
+                  AIVEN_DB="$AIVEN_DB" \
+                  AIVEN_PASSWORD="$AIVEN_PASSWORD" \
+                  ENABLE_VECTOR="$ENABLE_VECTOR" \
+                  KEEP_DUMP="$KEEP_DUMP" \
+                  bash -lc "'cd ${DEPLOY_PATH} && bash scripts/migrate_to_aiven.sh'"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Aiven migration"
+            echo "- Trigger: \`workflow_dispatch\`"
+            echo "- Host:    \`${{ secrets.DEPLOY_HOST }}\`"
+            echo "- Aiven:   \`${{ vars.AIVEN_HOST || 'pg-37455d5-matrixhub-db.c.aivencloud.com' }}/${{ vars.AIVEN_DB || 'defaultdb' }}\`"
+            echo
+            echo "**Next step**: paste the new \`DATABASE_URL\` printed in step '8.'/'10.' into matrix-hub's \`.env\` and restart the Hub container."
+          } >> "$GITHUB_STEP_SUMMARY"

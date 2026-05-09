@@ -1,0 +1,95 @@
+name: Aiven verify
+
+# Quick health + schema check against the Aiven Postgres service.
+# Runs:
+#   - on every push to master (catches accidental schema drift),
+#   - on every PR (so reviewers see if the PR breaks DB invariants),
+#   - daily on schedule (catches Aiven outages),
+#   - on manual dispatch.
+#
+# Required secret: AIVEN_DATABASE_URL
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aiven-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: psql checks
+    runs-on: ubuntu-latest
+    if: ${{ vars.DISABLE_AIVEN_VERIFY != 'true' }}
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify secret
+        shell: bash
+        env:
+          AIVEN_DATABASE_URL: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          if [ -z "$AIVEN_DATABASE_URL" ]; then
+            echo "::warning::AIVEN_DATABASE_URL secret missing — skipping verify."
+            exit 0
+          fi
+
+      - name: Install Postgres 17 client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+
+      - name: Connectivity + version
+        shell: bash
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: PGCONNECT_TIMEOUT=15 psql "$U" -c 'SELECT version(), current_database(), now();'
+
+      - name: Schema check
+        shell: bash
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          echo "→ public tables:"
+          psql "$U" -c "\dt public.*"
+          echo "→ extensions:"
+          psql "$U" -c "SELECT extname, extversion FROM pg_extension ORDER BY extname;"
+          # Required tables for matrix-hub catalog
+          for t in entity embedding_chunk remote; do
+            psql "$U" -tAc "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='$t';" \
+              | grep -q '^1$' || { echo "::error::missing required table: $t"; exit 1; }
+          done
+          echo "All required tables present."
+          # Required extensions
+          for e in pg_trgm; do
+            psql "$U" -tAc "SELECT 1 FROM pg_extension WHERE extname='$e';" \
+              | grep -q '^1$' || { echo "::warning::extension $e missing — search may be limited"; }
+          done
+
+      - name: Row counts
+        shell: bash
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          counts="$(psql "$U" -tAc \
+            "SELECT 'entity='||(SELECT count(*) FROM entity)||', embedding_chunk='||(SELECT count(*) FROM embedding_chunk)||', remote='||(SELECT count(*) FROM remote);")"
+          echo "$counts"
+          echo "## Aiven row counts" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$counts\`" >> "$GITHUB_STEP_SUMMARY"
