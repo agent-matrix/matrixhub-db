@@ -1,0 +1,162 @@
+name: Aiven bootstrap
+
+# One-click full bootstrap of the Aiven Postgres for matrix-hub.
+# Runs init → populate → verify in a single job. Idempotent — re-running
+# is safe (CREATE IF NOT EXISTS, ON CONFLICT DO UPDATE/NOTHING).
+#
+# Required secret:
+#   AIVEN_DATABASE_URL = postgresql://avnadmin:<PW>@HOST:PORT/defaultdb?sslmode=require
+#
+# Use this when:
+#   - first-time setup of a fresh Aiven service,
+#   - after rotating the Aiven password and wiring the new URL,
+#   - to force a full reseed of the catalog data.
+#
+# After this passes, the scheduled `Aiven verify` (every 30 min) and the
+# daily `Aiven backup` will start succeeding automatically.
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_statuses:
+        description: 'Catalog statuses to populate (comma list).'
+        required: false
+        default: 'active'
+      limit:
+        description: 'Max items (0 = all 7466 active).'
+        required: false
+        default: '0'
+      workers:
+        description: 'Parallel manifest fetches.'
+        required: false
+        default: '16'
+      enable_vector:
+        description: 'CREATE EXTENSION vector (pgvector)?'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aiven-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: init + populate + verify
+    runs-on: ubuntu-latest
+    if: ${{ vars.DISABLE_AIVEN_BOOTSTRAP != 'true' }}
+    timeout-minutes: 30
+
+    steps:
+      # ---------------------------------------------------------------- 0.
+      - name: Verify secret
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          if [ -z "$U" ]; then
+            echo "::error::AIVEN_DATABASE_URL secret missing. Settings → Secrets → Actions."
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------- 1.
+      - name: Install Postgres 17 client
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install psycopg
+        run: pip install --quiet 'psycopg[binary]'
+
+      # ---------------------------------------------------------------- 2.
+      - name: Fetch ops scripts from matrix-hub master
+        run: |
+          set -euo pipefail
+          mkdir -p scripts
+          curl -fsSL "https://raw.githubusercontent.com/agent-matrix/matrix-hub/master/scripts/init_aiven.sh" \
+            -o scripts/init_aiven.sh && chmod +x scripts/init_aiven.sh
+          curl -fsSL "https://raw.githubusercontent.com/agent-matrix/matrix-hub/master/scripts/populate_aiven_from_catalog.py" \
+            -o scripts/populate_aiven_from_catalog.py && chmod +x scripts/populate_aiven_from_catalog.py
+          wc -l scripts/init_aiven.sh scripts/populate_aiven_from_catalog.py
+
+      # ---------------------------------------------------------------- 3.
+      - name: Step 1 — init schema
+        env:
+          AIVEN_URL:     ${{ secrets.AIVEN_DATABASE_URL }}
+          ENABLE_VECTOR: ${{ inputs.enable_vector == 'true' && '1' || '0' }}
+          STRICT:        '0'
+          SEED_REMOTES:  '1'
+          PRINT_SECRET:  '0'
+        run: bash scripts/init_aiven.sh
+
+      # ---------------------------------------------------------------- 4.
+      - name: Step 2 — populate from catalog
+        env:
+          AIVEN_URL:        ${{ secrets.AIVEN_DATABASE_URL }}
+          INCLUDE_STATUSES: ${{ inputs.include_statuses }}
+          LIMIT:            ${{ inputs.limit }}
+          WORKERS:          ${{ inputs.workers }}
+          DRY_RUN:          '0'
+        run: python3 scripts/populate_aiven_from_catalog.py
+
+      # ---------------------------------------------------------------- 5.
+      - name: Step 3 — verify schema + extensions + counts
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          echo "→ public tables:"; psql "$U" -c "\dt public.*"
+          echo "→ extensions:";    psql "$U" -c "SELECT extname, extversion FROM pg_extension ORDER BY extname;"
+          for t in entity embedding_chunk remote; do
+            psql "$U" -tAc "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='$t';" \
+              | grep -q '^1$' || { echo "::error::missing required table: $t"; exit 1; }
+          done
+          for e in pg_trgm; do
+            psql "$U" -tAc "SELECT 1 FROM pg_extension WHERE extname='$e';" \
+              | grep -q '^1$' || { echo "::error::missing required extension: $e"; exit 1; }
+          done
+          counts="$(psql "$U" -tAc \
+            "SELECT 'entity='||(SELECT count(*) FROM entity)||', remote='||(SELECT count(*) FROM remote)||', embedding_chunk='||(SELECT count(*) FROM embedding_chunk);")"
+          echo "$counts"
+
+      # ---------------------------------------------------------------- 6.
+      - name: Summary
+        if: always()
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          counts="$(psql "$U" -tAc \
+            "SELECT 'entity='||(SELECT count(*) FROM entity)||', remote='||(SELECT count(*) FROM remote)||', embedding_chunk='||(SELECT count(*) FROM embedding_chunk);" 2>/dev/null || echo 'n/a')"
+          {
+            echo "## Aiven bootstrap"
+            echo "- include_statuses: \`${{ inputs.include_statuses }}\`"
+            echo "- limit:            \`${{ inputs.limit }}\`"
+            echo "- workers:          \`${{ inputs.workers }}\`"
+            echo "- enable_vector:    \`${{ inputs.enable_vector }}\`"
+            echo
+            echo "**Final row counts**: \`$counts\`"
+            echo
+            echo "Next: the scheduled \`Aiven verify\` (every 30 min) and"
+            echo "daily \`Aiven backup\` (03:17 UTC) start succeeding from now on."
+            echo "Public smoke from your laptop:"
+            echo
+            echo '```bash'
+            echo "curl -fsS https://api.matrixhub.io/catalog?limit=5"
+            echo "curl -fsS \"https://www.matrixhub.io/api/search?q=hello&type=mcp_server&limit=5\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

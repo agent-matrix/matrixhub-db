@@ -1,26 +1,28 @@
 name: Migrate OL9 → Aiven
 
 # Manually-triggered, one-shot migration of the legacy OL9 Postgres
-# container's data into the Aiven service. Wraps scripts/migrate_to_aiven.sh
-# by SSHing to the OL9 host and running it there (so pg_dump runs against
-# the live local container).
+# container's data into the Aiven service. SSHes to the OL9 host and
+# runs scripts/migrate_to_aiven.sh there (so pg_dump runs against the
+# live local container and pg_restore writes to Aiven).
 #
 # Required secrets:
-#   DEPLOY_HOST          OL9 public IP (141.148.40.165)
+#   DEPLOY_HOST          OL9 public IP (e.g. 141.148.40.165)
 #   DEPLOY_USER          opc
 #   DEPLOY_SSH_KEY       deploy private key
-#   DEPLOY_KNOWN_HOSTS   ssh-keyscan output for DEPLOY_HOST
 #   AIVEN_PASSWORD       avnadmin password (URL-encoding handled by the script)
+#
+# Optional secret:
+#   DEPLOY_KNOWN_HOSTS   ssh-keyscan output for DEPLOY_HOST.
+#                        If absent, the workflow runs ssh-keyscan itself at
+#                        the start of every run (trust on first use within
+#                        the runner, no host-key persistence between runs).
+#                        Set it explicitly to pin the key across runs.
 #
 # Optional repository variables:
 #   AIVEN_HOST  (default: pg-37455d5-matrixhub-db.c.aivencloud.com)
 #   AIVEN_PORT  (default: 24870)
 #   AIVEN_USER  (default: avnadmin)
 #   AIVEN_DB    (default: defaultdb)
-#   ENABLE_VECTOR (set to '1' to also create the pgvector extension)
-#
-# This is workflow_dispatch-only on purpose — running it twice is
-# disruptive; you typically only do it once at cutover time.
 
 on:
   workflow_dispatch:
@@ -50,38 +52,55 @@ jobs:
     name: SSH OL9 → migrate_to_aiven.sh
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment: aiven-migration   # require manual approval per repo settings
+    environment: aiven-migration
 
     steps:
       - name: Verify required secrets
         shell: bash
         env:
-          DEPLOY_HOST:        ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER:        ${{ secrets.DEPLOY_USER }}
-          DEPLOY_SSH_KEY:     ${{ secrets.DEPLOY_SSH_KEY }}
-          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-          AIVEN_PASSWORD:     ${{ secrets.AIVEN_PASSWORD }}
+          DEPLOY_HOST:    ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER:    ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          AIVEN_PASSWORD: ${{ secrets.AIVEN_PASSWORD }}
         run: |
           missing=()
-          [ -n "$DEPLOY_HOST"        ] || missing+=(DEPLOY_HOST)
-          [ -n "$DEPLOY_USER"        ] || missing+=(DEPLOY_USER)
-          [ -n "$DEPLOY_SSH_KEY"     ] || missing+=(DEPLOY_SSH_KEY)
-          [ -n "$DEPLOY_KNOWN_HOSTS" ] || missing+=(DEPLOY_KNOWN_HOSTS)
-          [ -n "$AIVEN_PASSWORD"     ] || missing+=(AIVEN_PASSWORD)
+          [ -n "$DEPLOY_HOST"    ] || missing+=(DEPLOY_HOST)
+          [ -n "$DEPLOY_USER"    ] || missing+=(DEPLOY_USER)
+          [ -n "$DEPLOY_SSH_KEY" ] || missing+=(DEPLOY_SSH_KEY)
+          [ -n "$AIVEN_PASSWORD" ] || missing+=(AIVEN_PASSWORD)
           if [ "${#missing[@]}" -gt 0 ]; then
             echo "::error::Missing required secrets: ${missing[*]}"
             exit 1
+          fi
+          # DEPLOY_KNOWN_HOSTS is optional — we ssh-keyscan if absent.
+          if [ -z "${{ secrets.DEPLOY_KNOWN_HOSTS }}" ]; then
+            echo "::notice::DEPLOY_KNOWN_HOSTS not set — will run ssh-keyscan on DEPLOY_HOST (TOFU mode)."
           fi
 
       - name: Configure SSH
         shell: bash
         env:
-          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          KNOWN:   ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          SSH_KEY:     ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN:       ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
-          printf '%s\n' "$KNOWN"  > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+          if [ -n "$KNOWN" ]; then
+            printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+            echo "Using DEPLOY_KNOWN_HOSTS from secret ($(wc -l < ~/.ssh/known_hosts) lines)."
+          else
+            echo "Running ssh-keyscan against $DEPLOY_HOST…"
+            ssh-keyscan -H -T 10 "$DEPLOY_HOST" > ~/.ssh/known_hosts 2>/dev/null || true
+            ssh-keyscan -H -T 10 -p 22 "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+            if ! [ -s ~/.ssh/known_hosts ]; then
+              echo "::error::ssh-keyscan returned no host keys — is DEPLOY_HOST reachable?"
+              exit 1
+            fi
+            echo "Captured $(wc -l < ~/.ssh/known_hosts) host key line(s) via ssh-keyscan."
+          fi
+          chmod 644 ~/.ssh/known_hosts
 
       - name: Run migrate_to_aiven.sh on OL9
         shell: bash
@@ -98,8 +117,6 @@ jobs:
           KEEP_DUMP:      ${{ inputs.keep_dump }}
         run: |
           set -euo pipefail
-          # Pass env through to the remote shell. AIVEN_PASSWORD travels in
-          # the SSH channel only and is masked in step logs.
           ssh -i ~/.ssh/id_deploy \
               -o StrictHostKeyChecking=yes \
               -o IdentitiesOnly=yes \
@@ -126,5 +143,9 @@ jobs:
             echo "- Host:    \`${{ secrets.DEPLOY_HOST }}\`"
             echo "- Aiven:   \`${{ vars.AIVEN_HOST || 'pg-37455d5-matrixhub-db.c.aivencloud.com' }}/${{ vars.AIVEN_DB || 'defaultdb' }}\`"
             echo
-            echo "**Next step**: paste the new \`DATABASE_URL\` printed in step '8.'/'10.' into matrix-hub's \`.env\` and restart the Hub container."
+            if [ -z "${{ secrets.DEPLOY_KNOWN_HOSTS }}" ]; then
+              echo ":bulb: DEPLOY_KNOWN_HOSTS was not set; this run used \`ssh-keyscan\` (TOFU)."
+              echo "Pin it for stronger MITM protection by adding the secret with the output of:"
+              echo "\`ssh-keyscan -H ${{ secrets.DEPLOY_HOST }}\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
