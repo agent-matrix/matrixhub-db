@@ -1,0 +1,97 @@
+name: Aiven init schema
+
+# One-click schema bootstrap for the Aiven Postgres service.
+# Idempotent — re-running is a no-op (CREATE EXTENSION IF NOT EXISTS,
+# CREATE TABLE IF NOT EXISTS, ON CONFLICT DO NOTHING).
+#
+# Required secret:
+#   AIVEN_DATABASE_URL
+#
+# Run BEFORE Aiven verify or Aiven populate:
+#   1. Aiven init schema     (this workflow)
+#   2. Populate Aiven from catalog
+#   3. Aiven verify         (will then go green)
+#
+# Optional inputs:
+#   enable_vector  default false  ('true' to also CREATE EXTENSION vector;
+#                                  only works on plans that ship pgvector)
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_vector:
+        description: 'Also CREATE EXTENSION vector (pgvector)?'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aiven-init
+  cancel-in-progress: false
+
+jobs:
+  init:
+    name: init schema + extensions
+    runs-on: ubuntu-latest
+    if: ${{ vars.DISABLE_AIVEN_INIT != 'true' }}
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify secret
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          if [ -z "$U" ]; then
+            echo "::error::AIVEN_DATABASE_URL secret is missing. Add it in Settings → Secrets → Actions."
+            exit 1
+          fi
+
+      - name: Install Postgres 17 client
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+
+      - name: Fetch init_aiven.sh
+        run: |
+          set -euo pipefail
+          mkdir -p scripts
+          curl -fsSL \
+            "https://raw.githubusercontent.com/agent-matrix/matrix-hub/master/scripts/init_aiven.sh" \
+            -o scripts/init_aiven.sh
+          chmod +x scripts/init_aiven.sh
+          wc -l scripts/init_aiven.sh
+
+      - name: Run init_aiven.sh against Aiven
+        env:
+          AIVEN_URL:     ${{ secrets.AIVEN_DATABASE_URL }}
+          ENABLE_VECTOR: ${{ inputs.enable_vector == 'true' && '1' || '0' }}
+          STRICT:        '0'
+          SEED_REMOTES:  '1'
+          PRINT_SECRET:  '0'
+        run: bash scripts/init_aiven.sh
+
+      - name: Quick row-count probe
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          counts="$(psql "$U" -tAc \
+            "SELECT 'entity='||(SELECT count(*) FROM entity)||', remote='||(SELECT count(*) FROM remote)||', embedding_chunk='||(SELECT count(*) FROM embedding_chunk);")"
+          echo "  $counts"
+          {
+            echo "## Aiven init"
+            echo "- enable_vector: \`${{ inputs.enable_vector }}\`"
+            echo "- row counts:    \`$counts\`"
+            echo
+            echo "Next step: run **Populate Aiven from catalog** to fill the entity table from agent-matrix/catalog."
+          } >> "$GITHUB_STEP_SUMMARY"
