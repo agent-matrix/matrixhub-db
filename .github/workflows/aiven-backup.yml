@@ -59,7 +59,13 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends postgresql-client-17
-          pg_dump --version
+          # ubuntu-latest pre-installs postgresql-client-16, which keeps
+          # /usr/bin/pg_dump pointing at v16 even after v17 is added.
+          # Prepend the v17 bin dir so subsequent steps pick up the
+          # matching binaries (pg_dump 16.x refuses to talk to a 17.x
+          # server: "aborting because of server version mismatch").
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/pg_dump --version
 
       - name: Probe Aiven
         shell: bash
