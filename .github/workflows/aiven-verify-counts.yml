@@ -1,0 +1,262 @@
+name: Aiven verify counts
+
+# Detailed health check for the `entity` table that powers MatrixHub:
+#   - confirms required columns exist on entity (schema drift detector)
+#   - reports per-type row counts (mcp_server / agent / tool / other)
+#   - reports the latest updated_at timestamp (staleness detector)
+#   - shows the live counts api.matrixhub.io is serving, side by side,
+#     so you can see at a glance whether the DB and API are in lockstep
+#
+# Runs:
+#   - every 30 min on schedule
+#   - on push to master/main and on PRs (catches schema-breaking changes)
+#   - manual dispatch
+#
+# Required secret: AIVEN_DATABASE_URL
+#
+# Exit codes:
+#   - DB unreachable                                  -> ::error:: (real outage)
+#   - DB fresh / entity missing                       -> ::warning:: + exit 0
+#   - entity column missing                           -> ::error:: (schema drift)
+#   - entity table empty                              -> ::warning:: + exit 0
+#   - everything present                              -> success
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aiven-verify-counts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-counts:
+    name: entity table + live API counts
+    runs-on: ubuntu-latest
+    if: ${{ vars.DISABLE_AIVEN_VERIFY_COUNTS != 'true' }}
+    timeout-minutes: 5
+
+    env:
+      HUB_API: https://api.matrixhub.io
+      # Required columns on entity. Add/remove as your schema evolves.
+      REQUIRED_COLUMNS: "uid type name version summary description capabilities frameworks providers quality_score created_at updated_at"
+
+    steps:
+      - name: Verify secret
+        env:
+          AIVEN_DATABASE_URL: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          if [ -z "$AIVEN_DATABASE_URL" ]; then
+            echo "::warning::AIVEN_DATABASE_URL secret missing - skipping verify."
+            exit 0
+          fi
+
+      - name: Install Postgres 17 client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+
+      - name: Check entity table exists
+        id: probe
+        shell: bash
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          has_entity="$(PGCONNECT_TIMEOUT=15 psql "$U" -tAc \
+            "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='entity';")"
+          if [ "$has_entity" = "1" ]; then
+            echo "has_entity=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_entity=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Friendly skip when entity table is missing
+        if: steps.probe.outputs.has_entity != 'true'
+        shell: bash
+        run: |
+          echo "::warning::Aiven DB does not have a public.entity table yet."
+          {
+            echo "## :information_source: entity table missing"
+            echo
+            echo "Run **Aiven bootstrap** or **Sync DB from catalog** to create"
+            echo "and populate it, then this workflow will go green automatically."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Verify required columns on entity
+        shell: bash
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          echo "-> entity columns:"
+          psql "$U" -c "\d+ entity" | head -40
+          MISSING=""
+          for col in $REQUIRED_COLUMNS; do
+            present="$(psql "$U" -tAc \
+              "SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='entity' AND column_name='$col';")"
+            if [ "$present" != "1" ]; then
+              MISSING="$MISSING $col"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::entity is missing required columns:$MISSING"
+            exit 1
+          fi
+          echo "All required columns present."
+
+      - name: Read per-type counts from Aiven
+        id: db
+        shell: bash
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          # Pull each type count separately so missing types report as 0.
+          db_mcp=$(psql "$U" -tAc "SELECT COUNT(*) FROM entity WHERE type='mcp_server';")
+          db_agent=$(psql "$U" -tAc "SELECT COUNT(*) FROM entity WHERE type='agent';")
+          db_tool=$(psql "$U" -tAc "SELECT COUNT(*) FROM entity WHERE type='tool';")
+          db_total=$(psql "$U" -tAc "SELECT COUNT(*) FROM entity;")
+          db_other=$(( db_total - db_mcp - db_agent - db_tool ))
+          db_latest=$(psql "$U" -tAc "SELECT MAX(updated_at) FROM entity;")
+          # Trim whitespace
+          db_mcp="${db_mcp// /}"; db_agent="${db_agent// /}"; db_tool="${db_tool// /}"
+          db_total="${db_total// /}"; db_latest="${db_latest//  / }"
+          {
+            echo "mcp=$db_mcp"
+            echo "agent=$db_agent"
+            echo "tool=$db_tool"
+            echo "other=$db_other"
+            echo "total=$db_total"
+            echo "latest=$db_latest"
+          } >> "$GITHUB_OUTPUT"
+          echo "== Aiven entity (DB) =="
+          printf "db mcp_server -> %s\n" "$db_mcp"
+          printf "db agent      -> %s\n" "$db_agent"
+          printf "db tool       -> %s\n" "$db_tool"
+          printf "db other      -> %s\n" "$db_other"
+          printf "db total      -> %s\n" "$db_total"
+          printf "db latest     -> %s\n" "$db_latest"
+
+      - name: Read per-type counts from api.matrixhub.io
+        id: api
+        shell: bash
+        run: |
+          set -euo pipefail
+          read_count() {
+            local t="$1"
+            curl -s --max-time 15 "${HUB_API}/catalog?type=${t}&limit=1" \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('total', 0))" 2>/dev/null \
+              || echo "0"
+          }
+          api_mcp=$(read_count mcp_server)
+          api_agent=$(read_count agent)
+          api_tool=$(read_count tool)
+          api_total=$(( api_mcp + api_agent + api_tool ))
+          {
+            echo "mcp=$api_mcp"
+            echo "agent=$api_agent"
+            echo "tool=$api_tool"
+            echo "total=$api_total"
+          } >> "$GITHUB_OUTPUT"
+          echo "== api.matrixhub.io (live) =="
+          printf "live mcp_server  -> %s\n" "$api_mcp"
+          printf "live tool        -> %s\n" "$api_tool"
+          printf "live agent       -> %s\n" "$api_agent"
+          printf "live total       -> %s\n" "$api_total"
+
+      - name: Detect drift between DB and API
+        id: drift
+        shell: bash
+        env:
+          DB_MCP:    ${{ steps.db.outputs.mcp }}
+          DB_AGENT:  ${{ steps.db.outputs.agent }}
+          DB_TOOL:   ${{ steps.db.outputs.tool }}
+          API_MCP:   ${{ steps.api.outputs.mcp }}
+          API_AGENT: ${{ steps.api.outputs.agent }}
+          API_TOOL:  ${{ steps.api.outputs.tool }}
+        run: |
+          set -euo pipefail
+          DRIFT=0
+          report_diff() {
+            local name="$1" db="$2" api="$3"
+            if [ "$db" != "$api" ]; then
+              local delta=$(( db - api ))
+              echo "::warning::$name drift: DB=$db API=$api (delta=$delta)"
+              DRIFT=$((DRIFT + 1))
+            fi
+          }
+          report_diff mcp_server "$DB_MCP"   "$API_MCP"
+          report_diff agent      "$DB_AGENT" "$API_AGENT"
+          report_diff tool       "$DB_TOOL"  "$API_TOOL"
+          echo "drift_count=$DRIFT" >> "$GITHUB_OUTPUT"
+          if [ "$DRIFT" -eq 0 ]; then
+            echo "No drift - DB and API are in lockstep."
+          else
+            echo "$DRIFT type(s) out of sync. The Hub probably needs to re-ingest:"
+            echo "  curl -X POST ${HUB_API}/remotes/sync"
+          fi
+
+      - name: Check if entity table is empty
+        if: steps.db.outputs.total == '0'
+        shell: bash
+        run: |
+          echo "::warning::entity table is EMPTY. Run 'Sync DB from catalog' to populate."
+          {
+            echo "## :warning: entity table empty"
+            echo
+            echo "The schema is present but no rows yet. Trigger the populator from"
+            echo "Actions -> **Sync DB from catalog** -> Run workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary
+        if: always() && steps.probe.outputs.has_entity == 'true'
+        shell: bash
+        env:
+          DB_MCP:    ${{ steps.db.outputs.mcp }}
+          DB_AGENT:  ${{ steps.db.outputs.agent }}
+          DB_TOOL:   ${{ steps.db.outputs.tool }}
+          DB_OTHER:  ${{ steps.db.outputs.other }}
+          DB_TOTAL:  ${{ steps.db.outputs.total }}
+          DB_LATEST: ${{ steps.db.outputs.latest }}
+          API_MCP:   ${{ steps.api.outputs.mcp }}
+          API_AGENT: ${{ steps.api.outputs.agent }}
+          API_TOOL:  ${{ steps.api.outputs.tool }}
+          API_TOTAL: ${{ steps.api.outputs.total }}
+          DRIFT:     ${{ steps.drift.outputs.drift_count }}
+        run: |
+          {
+            echo "## Aiven entity table verification"
+            echo ""
+            echo "| type | DB (Aiven) | API (live) | drift |"
+            echo "|---|---:|---:|---:|"
+            echo "| mcp_server | $DB_MCP   | $API_MCP   | $(( DB_MCP   - API_MCP )) |"
+            echo "| agent      | $DB_AGENT | $API_AGENT | $(( DB_AGENT - API_AGENT )) |"
+            echo "| tool       | $DB_TOOL  | $API_TOOL  | $(( DB_TOOL  - API_TOOL )) |"
+            echo "| other      | $DB_OTHER | -          | - |"
+            echo "| **total**  | **$DB_TOTAL** | **$API_TOTAL** | $(( DB_TOTAL - API_TOTAL )) |"
+            echo ""
+            echo "Latest \`updated_at\`: \`$DB_LATEST\`"
+            echo ""
+            if [ "${DRIFT:-0}" = "0" ]; then
+              echo ":white_check_mark: DB and API in lockstep."
+            else
+              echo ":warning: $DRIFT type(s) drifted. Trigger \`POST ${HUB_API}/remotes/sync\` or run **Sync DB from catalog** to reconcile."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
