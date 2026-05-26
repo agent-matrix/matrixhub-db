@@ -1,0 +1,188 @@
+name: Sync DB from catalog
+
+# Keeps the Aiven `entity` table in lockstep with
+# https://github.com/agent-matrix/catalog/blob/main/index.json
+# and then pings matrix-hub so api.matrixhub.io serves fresh counts.
+#
+# Three triggers:
+#   schedule              - weekly safety net (Mon 03:00 UTC, 45 min after
+#                           the catalog sync at 02:15 UTC).
+#   repository_dispatch   - fired by agent-matrix/catalog's sync.yml right
+#                           after a successful catalog update. Event type:
+#                           `catalog-updated`. Payload (optional, for logs):
+#                           { mcp, tools, agents, active }.
+#   workflow_dispatch     - manual click-to-run from the Actions UI.
+#
+# Required secret:
+#   AIVEN_DATABASE_URL = postgresql://avnadmin:<PW>@HOST:PORT/defaultdb?sslmode=require
+#
+# Optional inputs (workflow_dispatch only):
+#   include_statuses  default "active"  (try "active,deprecated" for everything except disabled)
+#   limit             default 0         (0 = no cap; for testing set e.g. 50)
+#   workers           default 16        (parallel manifest fetches)
+#   dry_run           default false     (fetch + transform without writing)
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  repository_dispatch:
+    types: [catalog-updated]
+  workflow_dispatch:
+    inputs:
+      include_statuses:
+        description: "Statuses to include (comma list)."
+        required: false
+        default: "active"
+      limit:
+        description: "Max items to process (0 = no cap)."
+        required: false
+        default: "0"
+      workers:
+        description: "Parallel manifest fetchers."
+        required: false
+        default: "16"
+      dry_run:
+        description: "DRY_RUN - fetch and transform without writing to Aiven."
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-db-from-catalog
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: catalog -> Aiven UPSERT -> Hub re-ingest
+    runs-on: ubuntu-latest
+    if: ${{ vars.DISABLE_SYNC_DB_FROM_CATALOG != 'true' }}
+    timeout-minutes: 30
+
+    env:
+      HUB_API: https://api.matrixhub.io
+
+    steps:
+      - name: Trigger context
+        shell: bash
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "Payload: mcp=${{ github.event.client_payload.mcp }} tools=${{ github.event.client_payload.tools }} agents=${{ github.event.client_payload.agents }} active=${{ github.event.client_payload.active }}"
+          fi
+
+      - name: Verify secret
+        env:
+          U: ${{ secrets.AIVEN_DATABASE_URL }}
+        run: |
+          if [ -z "$U" ]; then
+            echo "::error::AIVEN_DATABASE_URL secret is missing. Add it in Settings -> Secrets -> Actions."
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install psycopg
+        run: pip install --quiet 'psycopg[binary]'
+
+      - name: Fetch populate_aiven_from_catalog.py from matrix-hub
+        run: |
+          set -euo pipefail
+          mkdir -p scripts
+          curl -fsSL \
+            "https://raw.githubusercontent.com/agent-matrix/matrix-hub/master/scripts/populate_aiven_from_catalog.py" \
+            -o scripts/populate_aiven_from_catalog.py
+          chmod +x scripts/populate_aiven_from_catalog.py
+          wc -l scripts/populate_aiven_from_catalog.py
+
+      - name: Run populator (catalog -> Aiven UPSERT)
+        env:
+          AIVEN_URL:        ${{ secrets.AIVEN_DATABASE_URL }}
+          # inputs.* is null for schedule/repository_dispatch triggers,
+          # so fall back to the same defaults the workflow_dispatch advertises.
+          INCLUDE_STATUSES: ${{ inputs.include_statuses || 'active' }}
+          LIMIT:            ${{ inputs.limit || '0' }}
+          WORKERS:          ${{ inputs.workers || '16' }}
+          DRY_RUN:          ${{ inputs.dry_run == 'true' && '1' || '0' }}
+        run: python3 scripts/populate_aiven_from_catalog.py
+
+      - name: Ping matrix-hub to refresh its caches
+        if: success() && (inputs.dry_run != 'true')
+        shell: bash
+        run: |
+          # POST /remotes/sync is unauthenticated. The Hub re-reads
+          # catalog/main/index.json and upserts idempotently, ensuring
+          # api.matrixhub.io serves the new counts immediately.
+          echo "-> POST ${HUB_API}/remotes/sync"
+          set +e
+          RESP=$(curl -fsSL --max-time 30 -X POST "${HUB_API}/remotes/sync" 2>&1)
+          RC=$?
+          set -e
+          if [ $RC -eq 0 ]; then
+            JOB_ID=$(echo "$RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('job_id',''))" 2>/dev/null || true)
+            if [ -n "$JOB_ID" ]; then
+              echo "Hub re-ingest job: $JOB_ID"
+              echo "Status: ${HUB_API}/remotes/sync/$JOB_ID"
+            else
+              echo "Hub responded: $RESP"
+            fi
+          else
+            echo "::warning::Hub ping failed (rc=$RC): $RESP"
+            echo "::warning::Aiven was updated; the Hub will pick up changes on its next ingest cycle."
+          fi
+
+      - name: Verify counts on api.matrixhub.io
+        if: success() && (inputs.dry_run != 'true')
+        shell: bash
+        run: |
+          # Wait briefly for the Hub job to make progress, then snapshot
+          # the current counts so the step summary shows what is live.
+          sleep 20
+          for t in mcp_server agent tool; do
+            total=$(curl -s --max-time 10 "${HUB_API}/catalog?type=${t}&limit=1" \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo "?")
+            printf "%-12s -> %s\n" "$t" "$total"
+            echo "live_$t=$total" >> "$GITHUB_ENV"
+          done
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## DB sync result"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| trigger          | \`${{ github.event_name }}\` |"
+            echo "| include_statuses | \`${{ inputs.include_statuses || 'active' }}\` |"
+            echo "| limit            | \`${{ inputs.limit || '0' }}\` |"
+            echo "| workers          | \`${{ inputs.workers || '16' }}\` |"
+            echo "| dry_run          | \`${{ inputs.dry_run || 'false' }}\` |"
+            if [ -n "${live_mcp_server:-}" ]; then
+              echo "| live mcp_server  | ${live_mcp_server} |"
+              echo "| live tool        | ${live_tool} |"
+              echo "| live agent       | ${live_agent} |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Failure summary
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### Sync failed"
+            echo ""
+            echo "Trigger: \`${{ github.event_name }}\`"
+            echo ""
+            echo "Common causes:"
+            echo "- AIVEN_DATABASE_URL secret missing or wrong (check Settings -> Secrets)"
+            echo "- catalog/main/index.json temporarily unreachable"
+            echo "- matrix-hub script changed shape (compare against master)"
+          } >> "$GITHUB_STEP_SUMMARY"
